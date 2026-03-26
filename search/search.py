@@ -33,7 +33,8 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.amp import autocast, GradScaler
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(__file__))                      # search/ → search_space
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))     # project root → config, models, data
 
 from config import (
     data_cfg, distill_cfg, train_cfg, expert_drop_cfg,
