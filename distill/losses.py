@@ -155,10 +155,17 @@ class MoEDistillLoss(nn.Module):
         }
 
 
-def build_teacher(arch="resnet50", num_classes=200,
-                  pretrained=False, checkpoint=None):
+def build_teacher(arch="resnet50", num_classes=45,
+                  pretrained=False, checkpoint=None,
+                  image_size=224):
+    """
+    v5.2: 新增 image_size 参数
+    image_size < 128: 使用小图像适配 stem（3×3, stride=1）
+    image_size >= 128: 使用标准 ResNet-50 stem（7×7, stride=2）
+    """
     from models.backbone import BackboneResNet50Teacher
-    teacher = BackboneResNet50Teacher(num_classes=num_classes)
+    teacher = BackboneResNet50Teacher(num_classes=num_classes,
+                                      image_size=image_size)
     if checkpoint and __import__("os").path.exists(checkpoint):
         state = torch.load(checkpoint, map_location="cpu",
                            weights_only=False)

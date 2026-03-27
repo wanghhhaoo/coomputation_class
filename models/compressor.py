@@ -1,10 +1,12 @@
 """
-models/compressor.py — 特征压缩/解压 (v5.1)
+models/compressor.py — 特征压缩/解压 (v5.2)
 
 版本历史：
   v3: (B, 128, 32, 32) → 压缩 (B, 32, 4, 4) → 解压 (B, 64, 8, 8)   256× 压缩比
   v5.1: (B, 24, 8, 8) → 压缩 (B, 24, 4, 4) → 解压 (B, 48, 8, 8)   4× 压缩比
         in_channels == out_channels 时跳过 1×1 Conv，只做空间池化
+  v5.2: spatial_size=None → 无空间压缩（Phase A 验证上界）
+        pool = nn.Identity()，特征原样透传
 """
 
 import torch
@@ -13,15 +15,17 @@ import torch.nn as nn
 
 class FeatureCompressor(nn.Module):
     """
-    v5.1: in (B, 24, 8, 8) → out (B, 24, 4, 4)
-    通道不压缩（24→24），只做空间池化（8→4）
-    in_channels == out_channels 时跳过 1×1 Conv
+    v5.2:
+      spatial_size=None  → Phase A 无压缩（Identity pool，直接透传）
+      spatial_size=14    → 28→14，4× 空间压缩
+      spatial_size=7     → 28→7，16× 空间压缩
+      in_channels == out_channels 时跳过 1×1 Conv
     """
     def __init__(
         self,
         in_channels: int  = 24,
         out_channels: int = 24,
-        spatial_size: int = 4,
+        spatial_size      = None,   # None = 不压缩（Phase A）
         quantize: bool    = False,
     ):
         super().__init__()
@@ -38,7 +42,11 @@ class FeatureCompressor(nn.Module):
         else:
             self.conv = nn.Identity()
 
-        self.pool = nn.AdaptiveAvgPool2d(spatial_size)
+        # v5.2: spatial_size=None → Identity（无空间压缩）
+        if spatial_size is None:
+            self.pool = nn.Identity()
+        else:
+            self.pool = nn.AdaptiveAvgPool2d(spatial_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
@@ -54,10 +62,12 @@ class FeatureCompressor(nn.Module):
         return x_q.float() * scale
 
     def compress_info(self) -> str:
-        orig = 24 * 8 * 8
-        comp = 24 * 4 * 4
-        ratio = orig // comp
-        return f"压缩: {orig:,} → {comp:,}  ({ratio}× 压缩比)"
+        if self.spatial_size is None:
+            return "压缩: 无（Phase A 无压缩模式）"
+        orig = 24 * 28 * 28
+        comp = 24 * self.spatial_size * self.spatial_size
+        ratio = orig / max(comp, 1)
+        return f"压缩: {orig:,} → {comp:,}  ({ratio:.1f}× 压缩比)"
 
 
 class FeatureDecompressor(nn.Module):

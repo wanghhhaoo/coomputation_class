@@ -6,10 +6,13 @@ models/moe_system.py — MoE 系统 (v5.2)
   v5.2: 支持从 config dict 构建（供 search.py 使用）
         维度根据 cut_point 自动推导，无需手动传入
         保持旧的关键字参数接口向后兼容
+  v5.2 Phase A: spatial_size=None → 无解压器
+        主干截断特征直接喂给专家，验证增益上界
+        expert_in = feat_ch（不经过解压器）
 
-维度自动推导规则：
-  cut_point="stage1": feat_ch=24 → compress_out=24, decompress_out=48
-  cut_point="stage2": feat_ch=40 → compress_out=40, decompress_out=80
+维度自动推导规则（config dict 模式）：
+  spatial_size=None (Phase A): expert_in=feat_ch（无解压器）
+  spatial_size=14   (Phase B): expert_in=feat_ch*2（有解压器，通道翻倍）
 """
 
 import torch
@@ -54,7 +57,7 @@ class MoESystemTiny(nn.Module):
 
         # ── 解析参数：config dict 优先，否则用关键字参数 ──
         if config is not None:
-            num_classes    = config.get("num_classes",        200)
+            num_classes    = config.get("num_classes",        45)
             num_experts    = config.get("num_experts",        4)
             deploy_mode    = config.get("deploy_mode",        "local")
             expert_dropout = config.get("expert_dropout",     0.3)
@@ -65,8 +68,11 @@ class MoESystemTiny(nn.Module):
             expert_hidden  = config.get("expert_hidden_dim",  96)
             router_hidden  = config.get("router_hidden_dim",  64)
             expert_layers  = config.get("expert_num_layers",  2)
+            # v5.2: spatial_size=None → Phase A（无解压器）
+            spatial_size   = config.get("spatial_size",       None)
         else:
             expert_layers = 2   # 旧接口默认值
+            spatial_size  = 4   # 旧接口默认值（向后兼容）
 
         self.deploy_mode    = deploy_mode
         self.num_experts    = num_experts
@@ -87,22 +93,40 @@ class MoESystemTiny(nn.Module):
         feat_ch = self.backbone.feat_channels   # 24 or 40
 
         # ── 自动推导压缩器/解压器维度 ──────────────────────
-        # 如果是 config dict 模式，忽略旧接口的 compress_in/out/decompress_out
         if config is not None:
-            compress_in    = feat_ch
-            compress_out   = feat_ch        # 不压缩通道
-            decompress_out = feat_ch * 2    # 解压时通道翻倍
+            compress_in  = feat_ch
+            compress_out = feat_ch          # 通道不压缩
+
+            # v5.2 Phase A: spatial_size=None → 无解压器，expert 直接用压缩输出
+            if spatial_size is None:
+                self.use_decompressor = False
+                expert_in = compress_out    # 24 (stage1) or 40 (stage2)
+                decompress_out = expert_in  # 占位，不实际使用
+            else:
+                self.use_decompressor = True
+                decompress_out = feat_ch * 2   # 解压时通道翻倍
+                expert_in = decompress_out
+        else:
+            # 旧接口：始终使用解压器（向后兼容）
+            self.use_decompressor = True
+            expert_in = decompress_out
 
         # ── 构建各模块 ────────────────────────────────────
-        self.compressor   = FeatureCompressor(
+        self.compressor = FeatureCompressor(
             in_channels=compress_in,
             out_channels=compress_out,
+            spatial_size=spatial_size,     # None → Identity pool（Phase A）
             quantize=quantize,
         )
-        self.decompressor = FeatureDecompressor(
-            in_channels=compress_out,
-            out_channels=decompress_out,
-        )
+
+        if self.use_decompressor:
+            self.decompressor = FeatureDecompressor(
+                in_channels=compress_out,
+                out_channels=decompress_out,
+            )
+        else:
+            self.decompressor = None       # Phase A: 无解压器
+
         self.router = DynamicKRouter(
             in_channels=compress_out,
             hidden_dim=router_hidden,
@@ -111,7 +135,7 @@ class MoESystemTiny(nn.Module):
         )
         self.experts = build_experts(
             num_experts=num_experts,
-            in_channels=decompress_out,
+            in_channels=expert_in,
             hidden_dim=expert_hidden,
             num_classes=num_classes,
             num_layers=expert_layers,
@@ -137,12 +161,13 @@ class MoESystemTiny(nn.Module):
         self.backbone   = self.backbone.to(self.backbone_device)
         self.compressor = self.compressor.to(self.backbone_device)
         self.router     = self.router.to(self.backbone_device)
-        self.decompressors = nn.ModuleList([
-            FeatureDecompressor(
-                in_channels=self.compressor.pool.output_size[0],   # 兼容
-                out_channels=self.decompressor.conv2[-3].out_channels,
-            ).to(dev) for dev in self.expert_devices
-        ])
+        if self.use_decompressor:
+            self.decompressors = nn.ModuleList([
+                FeatureDecompressor(
+                    in_channels=self.decompressor.conv1[0].in_channels,
+                    out_channels=self.decompressor.conv2[0].out_channels,
+                ).to(dev) for dev in self.expert_devices
+            ])
         for i, dev in enumerate(self.expert_devices):
             self.experts[i] = self.experts[i].to(dev)
 
@@ -182,15 +207,19 @@ class MoESystemTiny(nn.Module):
         expert_feats  = []
 
         if self.deploy_mode == "local":
-            decompressed = self.decompressor(compressed)
+            # v5.2 Phase A: 无解压器时直接用压缩输出
+            decompressed = (self.decompressor(compressed)
+                            if self.use_decompressor else compressed)
             for i in active_indices:
                 logit, feat = self.experts[i](decompressed)
                 expert_logits.append((i, logit))
                 expert_feats.append(feat)
         else:
             for i in active_indices:
-                dev    = self.expert_devices[i]
-                decomp = self.decompressors[i](compressed.to(dev))
+                dev   = self.expert_devices[i]
+                comp  = compressed.to(dev)
+                decomp = (self.decompressors[i](comp)
+                          if self.use_decompressor else comp)
                 logit, feat = self.experts[i](decomp)
                 expert_logits.append((i, logit.to(self.backbone_device)))
                 expert_feats.append(feat.to(self.backbone_device))
@@ -238,21 +267,30 @@ class MoESystemTiny(nn.Module):
         print("[MoE] 主干已冻结，仅训练专家和路由器")
 
     def param_groups(self, lr: float, lr_backbone: float):
-        return [
-            {"params": self.backbone.parameters(),     "lr": lr_backbone},
-            {"params": self.compressor.parameters(),   "lr": lr},
-            {"params": self.decompressor.parameters(), "lr": lr},
-            {"params": self.router.parameters(),       "lr": lr},
-            {"params": self.experts.parameters(),      "lr": lr},
+        groups = [
+            {"params": self.backbone.parameters(),   "lr": lr_backbone},
+            {"params": self.compressor.parameters(), "lr": lr},
         ]
+        if self.use_decompressor:
+            groups.append({"params": self.decompressor.parameters(), "lr": lr})
+        groups += [
+            {"params": self.router.parameters(),   "lr": lr},
+            {"params": self.experts.parameters(),  "lr": lr},
+        ]
+        return groups
 
     def print_params(self):
         def cnt(m): return sum(p.numel() for p in m.parameters()) / 1e6
         total     = cnt(self)
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad) / 1e6
-        print(f"[MoE-Tiny 参数量]")
+        phase = "A（无解压器）" if not self.use_decompressor else "B（有解压器）"
+        print(f"[MoE-Tiny 参数量]  Phase {phase}")
         print(f"  Backbone (MobileNetV3-Small): {cnt(self.backbone):.2f}M")
         print(f"  Compressor:                  {cnt(self.compressor):.3f}M")
+        if self.use_decompressor:
+            print(f"  Decompressor:                {cnt(self.decompressor):.3f}M")
+        else:
+            print(f"  Decompressor:                (跳过，Phase A)")
         print(f"  Router:                      {cnt(self.router):.3f}M")
         print(f"  Experts × {self.num_experts}:               {cnt(self.experts):.2f}M")
         print(f"  ──────────────────────────────────")

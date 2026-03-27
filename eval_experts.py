@@ -10,7 +10,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config       import data_cfg, expert_cfg, router_cfg, compressor_cfg
-from data.dataset import build_dataloaders
+from data.dataset import build_resisc45_dataloaders
 from models.moe_system import MoESystemTiny
 from torch.amp import autocast
 
@@ -55,7 +55,7 @@ def eval_with_experts(model, val_loader, device, expert_indices,
                 logits = backbone_logits
             else:
                 compressed   = model.compressor(backbone_feat)
-                decompressed = model.decompressor(compressed)
+                decompressed = model.decompressor(compressed) if model.use_decompressor else compressed
 
                 expert_logit_list = []
                 for idx in expert_indices:
@@ -94,22 +94,21 @@ def run_eval(args):
     device    = torch.device(f"cuda:{args.gpus}" if torch.cuda.is_available() else "cpu")
     amp_dtype = torch.bfloat16
 
-    _, val_loader, _ = build_dataloaders(
-        data_cfg.train_dir, data_cfg.val_dir,
+    _, val_loader, _ = build_resisc45_dataloaders(
+        data_cfg.data_dir,
         image_size=data_cfg.image_size, batch_size=256,
         num_workers=data_cfg.num_workers,
     )
 
-    model = MoESystemTiny(
-        num_classes=200, expert_dropout=0.0,
-        num_experts=router_cfg.num_experts,
-        dropout_rate=expert_cfg.dropout_rate,
-        compress_in=compressor_cfg.in_channels,
-        compress_out=compressor_cfg.out_channels,
-        decompress_out=expert_cfg.in_channels,
-        expert_hidden=expert_cfg.hidden_dim,
-        router_hidden=router_cfg.hidden_dim,
-    ).to(device)
+    model = MoESystemTiny(config={
+        "num_classes":   data_cfg.num_classes,
+        "spatial_size":  compressor_cfg.spatial_size,
+        "feat_ch":       compressor_cfg.in_channels,
+        "compress_ch":   compressor_cfg.out_channels,
+        "expert_hidden": expert_cfg.hidden_dim,
+        "num_experts":   router_cfg.num_experts,
+        "expert_dropout": 0.0,
+    }).to(device)
     assert os.path.exists(args.ckpt), f"找不到 checkpoint: {args.ckpt}"
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model"])
@@ -192,7 +191,7 @@ def run_eval(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt", type=str, default="checkpoints_tiny/stage3_best.pth")
+    p.add_argument("--ckpt", type=str, default="checkpoints_resisc/stage3_best.pt")
     p.add_argument("--gpus", type=str, default="1")
     args = p.parse_args()
     run_eval(args)

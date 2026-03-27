@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>MoE 分布式推理系统 — 训练架构</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', 'PingFang SC', sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    padding: 32px 24px;
+  }
+  h1 {
+    text-align: center;
+    font-size: 22px;
+    font-weight: 600;
+    color: #f0f4ff;
+    margin-bottom: 6px;
+    letter-spacing: 0.5px;
+  }
+  .subtitle {
+    text-align: center;
+    font-size: 13px;
+    color: #64748b;
+    margin-bottom: 36px;
+  }
+
+  /* ── 阶段卡片 ── */
+  .stage-card {
+    background: #161b27;
+    border: 1px solid #2a3044;
+    border-radius: 14px;
+    padding: 24px 28px 28px;
+    margin-bottom: 28px;
+    position: relative;
+  }
+  .stage-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: 6px;
+    display: inline-block;
+    margin-bottom: 20px;
+  }
+  .stage0 .stage-label { background: #1e3a5f; color: #60a5fa; border: 1px solid #2563eb44; }
+  .stage2 .stage-label { background: #1e3a2a; color: #4ade80; border: 1px solid #16a34a44; }
+  .stage3 .stage-label { background: #3a1e3a; color: #c084fc; border: 1px solid #9333ea44; }
+
+  /* ── Flow row ── */
+  .flow {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .flow + .flow { margin-top: 18px; }
+
+  /* ── Node boxes ── */
+  .node {
+    flex-shrink: 0;
+    border-radius: 10px;
+    padding: 10px 14px;
+    text-align: center;
+    font-size: 12.5px;
+    font-weight: 500;
+    line-height: 1.4;
+    min-width: 100px;
+    position: relative;
+  }
+  .node .dim {
+    font-size: 10px;
+    font-weight: 400;
+    opacity: 0.65;
+    margin-top: 3px;
+    display: block;
+  }
+  .node-image   { background: #1e293b; border: 1.5px solid #334155; color: #94a3b8; }
+  .node-backbone{ background: #1e3a5f; border: 1.5px solid #2563eb; color: #93c5fd; }
+  .node-teacher { background: #3a1e1e; border: 1.5px solid #dc2626; color: #fca5a5; }
+  .node-feat    { background: #1a2a1a; border: 1.5px solid #16a34a; color: #86efac; }
+  .node-compress{ background: #2a2a1e; border: 1.5px solid #ca8a04; color: #fde047; }
+  .node-expert  { background: #2a1e3a; border: 1.5px solid #7c3aed; color: #c4b5fd; }
+  .node-router  { background: #1e2a3a; border: 1.5px solid #0891b2; color: #67e8f9; }
+  .node-fuse    { background: #3a2a1e; border: 1.5px solid #ea580c; color: #fdba74; }
+  .node-loss    { background: #3a1e2a; border: 1.5px solid #be185d; color: #f9a8d4; }
+  .node-head    { background: #1e1e3a; border: 1.5px solid #6366f1; color: #a5b4fc; }
+  .node-logits  { background: #1a2a2a; border: 1.5px solid #0f766e; color: #5eead4; }
+
+  /* ── Arrow ── */
+  .arrow {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    padding: 0 4px;
+    color: #475569;
+    font-size: 18px;
+    user-select: none;
+  }
+  .arrow-label {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0 2px;
+    color: #475569;
+    font-size: 10px;
+    gap: 1px;
+  }
+  .arrow-label span { color: #64748b; }
+
+  /* ── Vertical connector ── */
+  .v-group {
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+    margin-top: 18px;
+  }
+  .v-branch {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    align-items: center;
+  }
+  .v-arrow {
+    color: #475569;
+    font-size: 18px;
+    text-align: center;
+  }
+
+  /* ── Expert group ── */
+  .expert-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .expert-group .node-expert { min-width: 80px; font-size: 11.5px; padding: 8px 10px; }
+
+  /* ── Loss section ── */
+  .loss-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid #2a3044;
+    align-items: center;
+  }
+  .loss-tag {
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  .loss-ce   { background: #1e3a2a; border: 1px solid #16a34a; color: #4ade80; }
+  .loss-kd   { background: #3a1e1e; border: 1px solid #dc2626; color: #f87171; }
+  .loss-bal  { background: #3a2a1e; border: 1px solid #ea580c; color: #fb923c; }
+  .loss-orth { background: #2a1e3a; border: 1px solid #7c3aed; color: #a78bfa; }
+  .loss-plus { color: #475569; font-size: 16px; font-weight: 300; }
+  .loss-desc { font-size: 10.5px; color: #475569; margin-top: 8px; line-height: 1.6; }
+
+  /* ── Alpha bar ── */
+  .alpha-formula {
+    background: #1e2a3a;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 12px;
+    color: #94a3b8;
+    margin: 14px 0 0;
+    font-family: 'Courier New', monospace;
+  }
+  .alpha-formula .hl { color: #fdba74; font-weight: 600; }
+  .alpha-formula .hl2 { color: #c4b5fd; font-weight: 600; }
+  .alpha-formula .hl3 { color: #67e8f9; }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 28px;
+    padding: 16px 20px;
+    background: #161b27;
+    border: 1px solid #2a3044;
+    border-radius: 10px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11.5px;
+    color: #94a3b8;
+  }
+  .legend-dot {
+    width: 12px; height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+
+  /* ── Phase badge ── */
+  .phase-badge {
+    display: inline-block;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-left: 8px;
+    vertical-align: middle;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .badge-a { background: #164e63; color: #67e8f9; border: 1px solid #0891b2; }
+  .badge-b { background: #3b1764; color: #c084fc; border: 1px solid #7c3aed; }
+
+  /* ── Section divider ── */
+  .divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 4px 0 20px;
+  }
+  .divider-line { flex: 1; height: 1px; background: #2a3044; }
+  .divider-text { font-size: 11px; color: #475569; white-space: nowrap; }
+
+  /* ── Note box ── */
+  .note {
+    background: #1e2a1e;
+    border-left: 3px solid #16a34a;
+    border-radius: 0 8px 8px 0;
+    padding: 10px 14px;
+    font-size: 11.5px;
+    color: #86efac;
+    margin-top: 14px;
+    line-height: 1.6;
+  }
+  .note.warn {
+    background: #2a1e1e;
+    border-left-color: #dc2626;
+    color: #fca5a5;
+  }
+
+  /* ── Big layout ── */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+
+  .sep-arrow {
+    text-align: center;
+    font-size: 28px;
+    color: #334155;
+    margin: 8px 0;
+  }
+  .stage-title { font-size: 14px; font-weight: 600; color: #e2e8f0; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+
+<h1>MoE 分布式推理系统 — 训练架构</h1>
+<p class="subtitle">NWPU-RESISC45 · 45 类 · 224×224 · Phase A（无压缩验证）</p>
+
+<!-- ══════════════════════════════════════════════════════
+     STAGE 0 — Teacher Pretrain
+═══════════════════════════════════════════════════════ -->
+<div class="stage-card stage0">
+  <div class="stage-label">Teacher Pretrain — pretrain_teacher.py</div>
+
+  <div class="flow">
+    <div class="node node-image">
+      训练图像<br>
+      <span class="dim">224×224 RGB</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="node node-teacher">
+      ResNet-50<br>
+      <span class="dim">ImageNet 预训练</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="node node-logits">
+      Teacher Logits<br>
+      <span class="dim">(B, 45)</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="node node-loss">
+      CE Loss<br>
+      <span class="dim">GT Labels</span>
+    </div>
+  </div>
+
+  <div class="loss-desc">
+    两阶段微调：① 前 5 epoch 冻结 stem+layer1~3，只训 layer4+FC（lr=1e-3）<br>
+    ② 剩余 epoch 全量微调（lr=5e-4）→ 最终 teacher 在 RESISC45 验证集 ~94%
+  </div>
+</div>
+
+<div class="sep-arrow">↓</div>
+
+<!-- ══════════════════════════════════════════════════════
+     STAGE 2 — Backbone Distillation
+═══════════════════════════════════════════════════════ -->
+<div class="stage-card stage2">
+  <div class="stage-label">Stage 2 — 主干蒸馏 (train.py --stage 2)</div>
+
+  <div class="flow">
+    <div class="node node-image">
+      训练图像<br>
+      <span class="dim">224×224</span>
+    </div>
+    <div class="arrow">→</div>
+
+    <!-- MobileNetV3 完整 -->
+    <div class="node node-backbone" style="min-width:140px;">
+      MobileNetV3-Small<br>
+      <span class="dim">layers 0→11 完整前向</span>
+    </div>
+    <div class="arrow">→</div>
+
+    <!-- Standalone Head -->
+    <div class="node node-head">
+      Standalone Head<br>
+      <span class="dim">GAP → FC(45)</span>
+    </div>
+    <div class="arrow">→</div>
+
+    <div class="node node-logits">
+      Student Logits<br>
+      <span class="dim">(B, 45)</span>
+    </div>
+  </div>
+
+  <!-- Teacher branch -->
+  <div class="flow" style="margin-top:12px;">
+    <div class="node node-image" style="opacity:0.3; min-width:100px;">同一批图像</div>
+    <div class="arrow">→</div>
+    <div class="node node-teacher">
+      ResNet-50<br>
+      <span class="dim">冻结，不更新</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="node node-logits">
+      Teacher Logits<br>
+      <span class="dim">(B, 45)</span>
+    </div>
+  </div>
+
+  <div class="loss-row">
+    <div class="loss-tag loss-ce">γ · CE(student, labels)</div>
+    <div class="loss-plus">+</div>
+    <div class="loss-tag loss-kd">β · KD(student ‖ teacher, T=4)</div>
+    <div style="flex:1"></div>
+  </div>
+  <div class="note">
+    Stage 2 目标：让主干 standalone head 在 RESISC45 上独立分类 → 最终 Val Acc@1 ≈ 94%<br>
+    输出：<code>stage2_best.pt</code>（含主干权重 + standalone_head）
+  </div>
+</div>
+
+<div class="sep-arrow">↓</div>
+
+<!-- ══════════════════════════════════════════════════════
+     STAGE 3 — Full MoE Distillation
+═══════════════════════════════════════════════════════ -->
+<div class="stage-card stage3">
+  <div class="stage-label">
+    Stage 3 — MoE 全系统蒸馏 (train.py --stage 3)
+    <span class="phase-badge badge-a">Phase A: 无压缩</span>
+  </div>
+
+  <!-- ── Row 1: 设备端 ── -->
+  <div class="divider">
+    <div class="divider-line"></div>
+    <div class="divider-text">① 设备端（MobileNetV3 截断）</div>
+    <div class="divider-line"></div>
+  </div>
+
+  <div class="flow">
+    <div class="node node-image">
+      输入图像<br>
+      <span class="dim">224×224</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="node node-backbone" style="min-width:160px;">
+      MobileNetV3-Small<br>
+      <span class="dim">On-Device 部分<br>layers 0~3 (stage1)</span>
+    </div>
+
+    <!-- 两个输出分支 -->
+    <div style="display:flex; flex-direction:column; gap:8px; margin-left:8px;">
+      <!-- 分支1: truncated feature -->
+      <div class="flow" style="margin-top:0;">
+        <div class="arrow">→</div>
+        <div class="node node-feat" style="min-width:120px;">
+          截断特征<br>
+          <span class="dim">(B, 24, 28, 28)</span>
+        </div>
+        <div class="arrow-label">
+          <span style="color:#0891b2; font-size:16px">→</span>
+          <span>传输到服务器</span>
+        </div>
+      </div>
+      <!-- 分支2: standalone head -->
+      <div class="flow" style="margin-top:0;">
+        <div class="arrow">→</div>
+        <div class="node node-head">
+          Standalone Head<br>
+          <span class="dim">剩余 layers + FC(45)</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="node node-logits" style="min-width:110px;">
+          backbone_logits<br>
+          <span class="dim">(B, 45)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Row 2: 服务器端 ── -->
+  <div class="divider" style="margin-top:20px;">
+    <div class="divider-line"></div>
+    <div class="divider-text">② 服务器端（Router + Experts）</div>
+    <div class="divider-line"></div>
+  </div>
+
+  <div style="display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap;">
+
+    <!-- Phase A: 无压缩路径 -->
+    <div style="display:flex; flex-direction:column; align-items:center; gap:8px;">
+      <div class="node node-compress" style="min-width:130px;">
+        Compressor<br>
+        <span class="dim">Phase A: Identity<br>spatial_size=None</span>
+      </div>
+      <div class="v-arrow">↓</div>
+      <div class="node node-feat" style="min-width:130px;">
+        压缩特征（同输入）<br>
+        <span class="dim">(B, 24, 28, 28)</span>
+      </div>
+    </div>
+
+    <div style="display:flex; align-items:center; font-size:20px; color:#475569; padding-top:30px;">→</div>
+
+    <!-- Router -->
+    <div style="display:flex; flex-direction:column; align-items:center; gap:8px;">
+      <div class="node node-router" style="min-width:140px;">
+        Dynamic K Router<br>
+        <span class="dim">GAP → Linear → Softmax<br>阈值门控 k=1~4</span>
+      </div>
+      <div class="v-arrow" style="color:#64748b; font-size:11px; text-align:center;">
+        gate_weights (B,4)<br>active_indices
+      </div>
+    </div>
+
+    <div style="display:flex; align-items:center; font-size:20px; color:#475569; padding-top:30px;">→</div>
+
+    <!-- Experts -->
+    <div style="display:flex; flex-direction:column; gap:8px;">
+      <div class="expert-group">
+        <div class="node node-expert">Expert 0<br><span class="dim">Conv+GAP+FC(45)</span></div>
+        <div class="node node-expert">Expert 1<br><span class="dim">Conv+GAP+FC(45)</span></div>
+        <div class="node node-expert">Expert 2<br><span class="dim">Conv+GAP+FC(45)</span></div>
+        <div class="node node-expert">Expert 3<br><span class="dim">Conv+GAP+FC(45)</span></div>
+      </div>
+      <div style="font-size:10.5px; color:#64748b; text-align:center;">
+        各 0.35M 参数 · 合计 1.4M
+      </div>
+    </div>
+
+    <div style="display:flex; align-items:center; font-size:20px; color:#475569; padding-top:30px;">→</div>
+
+    <!-- Expert fused logits -->
+    <div style="display:flex; flex-direction:column; align-items:center; gap:8px; padding-top:20px;">
+      <div class="node node-logits" style="min-width:120px;">
+        expert_fused<br>
+        <span class="dim">加权平均 (B,45)</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Row 3: 融合 ── -->
+  <div class="divider" style="margin-top:20px;">
+    <div class="divider-line"></div>
+    <div class="divider-text">③ Alpha 加权融合</div>
+    <div class="divider-line"></div>
+  </div>
+
+  <div class="alpha-formula">
+    <span class="hl">final_logits</span>
+    &nbsp;=&nbsp;
+    <span class="hl3">α</span> × <span class="hl">backbone_logits</span>
+    &nbsp;+&nbsp;
+    (1 − <span class="hl3">α</span>) × <span class="hl2">expert_fused</span>
+    &nbsp;&nbsp;&nbsp;
+    <span style="color:#475569;">// α 从 0.7 线性退火到 α_end (0.3 or 0.5)</span>
+  </div>
+
+  <!-- Teacher branch in Stage 3 -->
+  <div class="flow" style="margin-top:16px;">
+    <div class="node node-image" style="opacity:0.3;">同一批图像</div>
+    <div class="arrow">→</div>
+    <div class="node node-teacher">
+      ResNet-50 Teacher<br>
+      <span class="dim">冻结</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="node node-logits">
+      teacher_logits<br>
+      <span class="dim">(B, 45)</span>
+    </div>
+  </div>
+
+  <!-- ── Loss ── -->
+  <div class="divider" style="margin-top:20px;">
+    <div class="divider-line"></div>
+    <div class="divider-text">④ 损失函数</div>
+    <div class="divider-line"></div>
+  </div>
+
+  <div class="loss-row" style="border-top:none; margin-top:0; padding-top:0;">
+    <div class="loss-tag loss-ce">γ · CE(final, labels)</div>
+    <div class="loss-plus">+</div>
+    <div class="loss-tag loss-kd">β · KD(final ‖ teacher, T=4)</div>
+    <div class="loss-plus">+</div>
+    <div class="loss-tag loss-bal">w_bal · BalanceLoss</div>
+    <div class="loss-plus">+</div>
+    <div class="loss-tag loss-orth">w_ort · OrthoLoss</div>
+  </div>
+
+  <div class="loss-desc" style="margin-top:10px;">
+    <b style="color:#4ade80">CE</b>：交叉熵，主监督信号（γ=1.0）&nbsp;&nbsp;
+    <b style="color:#f87171">KD</b>：知识蒸馏软标签对齐，T=4（β=1.0）<br>
+    <b style="color:#fb923c">Balance</b>：惩罚专家负载不均，防止路由器塌缩（w=0.1）&nbsp;&nbsp;
+    <b style="color:#a78bfa">Ortho</b>：正交损失，惩罚专家特征同质化（w=0.5）
+  </div>
+
+  <div class="note">
+    Stage 3 输入：stage2_best.pt（完整加载包含 standalone_head，零 shape 不匹配）<br>
+    输出：stage3_best.pt &nbsp;·&nbsp; 训练完成后自动运行 eval_experts.py + eval_alpha_sweep.py
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     推理路径
+═══════════════════════════════════════════════════════ -->
+<div class="stage-card" style="border-color:#1e3a5f;">
+  <div class="stage-label" style="background:#1e2a3a; color:#94a3b8; border-color:#33405488;">推理路径（部署）</div>
+
+  <div class="two-col">
+    <div>
+      <div class="stage-title">设备端（低功耗）</div>
+      <div class="flow" style="margin-top:10px;">
+        <div class="node node-image">图像<br><span class="dim">224×224</span></div>
+        <div class="arrow">→</div>
+        <div class="node node-backbone" style="min-width:130px;">MobileNetV3<br><span class="dim">layers 0~3</span></div>
+        <div class="arrow">→</div>
+        <div class="node node-feat">特征<br><span class="dim">(B,24,28,28)</span></div>
+        <div class="arrow-label">
+          <span style="color:#0891b2; font-size:16px">→</span>
+          <span>轻量传输</span>
+        </div>
+      </div>
+      <div class="loss-desc" style="margin-top:8px;">
+        同时 standalone_head 输出 backbone_logits（本地兜底预测）
+      </div>
+    </div>
+    <div>
+      <div class="stage-title">服务器端（高性能）</div>
+      <div class="flow" style="margin-top:10px;">
+        <div class="node node-feat">特征<br><span class="dim">接收</span></div>
+        <div class="arrow">→</div>
+        <div class="node node-router">Router<br><span class="dim">动态选 k</span></div>
+        <div class="arrow">→</div>
+        <div class="node node-expert">k 个专家<br><span class="dim">并行推理</span></div>
+        <div class="arrow">→</div>
+        <div class="node node-fuse">α 融合<br><span class="dim">最终预测</span></div>
+      </div>
+      <div class="loss-desc" style="margin-top:8px;">
+        Phase A 无压缩：特征直接传输（24×28×28=18816 floats）<br>
+        Phase B 有压缩：压缩到更小 spatial，减少带宽
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     参数规模 & 图例
+═══════════════════════════════════════════════════════ -->
+<div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:0;">
+  <div class="stage-card" style="border-color:#2a3044; padding:16px 20px;">
+    <div style="font-size:12px; font-weight:600; color:#94a3b8; margin-bottom:12px;">参数规模</div>
+    <table style="width:100%; font-size:11.5px; border-collapse:collapse; color:#94a3b8;">
+      <tr><td style="padding:4px 0; color:#e2e8f0">MobileNetV3-Small</td><td style="text-align:right;">2.5M</td></tr>
+      <tr><td style="padding:4px 0; color:#e2e8f0">Compressor (Phase A: Identity)</td><td style="text-align:right;">—</td></tr>
+      <tr><td style="padding:4px 0; color:#e2e8f0">Dynamic K Router</td><td style="text-align:right;">~0.1M</td></tr>
+      <tr><td style="padding:4px 0; color:#e2e8f0">4 × Expert (Conv+FC)</td><td style="text-align:right;">1.4M</td></tr>
+      <tr style="border-top:1px solid #2a3044;">
+        <td style="padding:6px 0; color:#f0f4ff; font-weight:600;">系统总计（设备+服务器）</td>
+        <td style="text-align:right; color:#f0f4ff; font-weight:600;">~4.0M</td>
+      </tr>
+      <tr><td style="padding:4px 0; color:#e2e8f0">ResNet-50 Teacher（仅训练用）</td><td style="text-align:right;">25M</td></tr>
+    </table>
+  </div>
+
+  <div class="legend" style="margin-top:0; border-color:#2a3044;">
+    <div style="font-size:12px; font-weight:600; color:#94a3b8; width:100%; margin-bottom:4px;">模块颜色图例</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#2563eb;"></div>主干 Backbone</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#dc2626;"></div>教师 Teacher</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#16a34a;"></div>特征张量</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ca8a04;"></div>压缩器</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#7c3aed;"></div>专家 Expert</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#0891b2;"></div>路由器 Router</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ea580c;"></div>融合层 Fuse</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#be185d;"></div>损失函数 Loss</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#6366f1;"></div>分类头 Head</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#0f766e;"></div>输出 Logits</div>
+  </div>
+</div>
+
+</body>
+</html>

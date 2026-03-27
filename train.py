@@ -1,14 +1,15 @@
 """
-train.py — Tiny-ImageNet MoE 训练 (v4)
+train.py — NWPU-RESISC45 MoE 训练 (v5.2)
 
-v4 核心变更：
-  1. Stage 2: 验证时同时打印 standalone 精度（含保底提示）
-  （backbone.py / config.py 的改动见对应文件）
+v5.2 核心变更：
+  1. 切换数据集 Tiny-ImageNet → NWPU-RESISC45（224×224，45 类）
+  2. 使用 config dict 接口构建 MoESystemTiny（自动处理 Phase A 无解压器）
+  3. 更新 build_teacher 调用（num_classes=45，image_size=224）
 
 运行：
-  nohup python pretrain_teacher.py --gpus 1 > checkpoints_tiny/teacher.log 2>&1 && \
-  python train.py --stage 2 --gpus 1 > checkpoints_tiny/stage2.log 2>&1 && \
-  python train.py --stage 3 --gpus 1 > checkpoints_tiny/stage3.log 2>&1 &
+  python pretrain_teacher.py --gpus 0 > checkpoints_resisc/teacher.log 2>&1 &&
+  python train.py --stage 2 --gpus 0 > checkpoints_resisc/stage2.log 2>&1 &&
+  python train.py --stage 3 --gpus 0 > checkpoints_resisc/stage3.log 2>&1
 """
 
 import os, sys, time, argparse, datetime
@@ -27,7 +28,47 @@ from config import (
     deploy_cfg, DEPLOY_MODE, expert_drop_cfg, expert_cfg,
     alpha_sched_cfg, router_cfg, compressor_cfg,
 )
-from data.dataset      import build_dataloaders
+
+
+def _build_dataloaders(use_strong_aug=False):
+    """根据 data_cfg.dataset 选择正确的数据加载器"""
+    if data_cfg.dataset == "resisc45":
+        return build_resisc45_dataloaders(
+            data_cfg.data_dir,
+            image_size=data_cfg.image_size,
+            batch_size=train_cfg.batch_size,
+            num_workers=data_cfg.num_workers,
+            train_ratio=data_cfg.train_ratio,
+            use_strong_aug=use_strong_aug,
+        )
+    else:
+        return build_dataloaders(
+            data_cfg.train_dir, data_cfg.val_dir,
+            image_size=data_cfg.image_size,
+            batch_size=train_cfg.batch_size,
+            num_workers=data_cfg.num_workers,
+            use_strong_aug=use_strong_aug,
+        )
+
+
+def _build_moe_model(deploy_mode="local"):
+    """用 config dict 接口构建 MoESystemTiny（自动处理 Phase A/B）"""
+    return MoESystemTiny(config={
+        "head_type":          backbone_cfg.head_type,
+        "cut_point":          backbone_cfg.cut_point,
+        "num_classes":        data_cfg.num_classes,
+        "num_experts":        router_cfg.num_experts,
+        "expert_dropout":     expert_drop_cfg.expert_dropout,
+        "expert_hidden_dim":  expert_cfg.hidden_dim,
+        "expert_num_layers":  expert_cfg.num_layers,
+        "router_hidden_dim":  router_cfg.hidden_dim,
+        "alpha_start":        alpha_sched_cfg.alpha_start,
+        "balance_loss_weight": router_cfg.balance_loss_weight,
+        "dropout_rate":       expert_cfg.dropout_rate,
+        "spatial_size":       compressor_cfg.spatial_size,
+        "deploy_mode":        deploy_mode,
+    })
+from data.dataset      import build_dataloaders, build_resisc45_dataloaders
 from models.moe_system import MoESystemTiny
 from distill.losses    import BackboneDistillLoss, MoEDistillLoss, build_teacher
 
@@ -163,28 +204,17 @@ def train_stage2(args, device):
           f"Epochs: {train_cfg.epochs_stage2}")
     sep("═"); print()
 
-    train_loader, val_loader, _ = build_dataloaders(
-        data_cfg.train_dir, data_cfg.val_dir,
-        image_size=data_cfg.image_size,
-        batch_size=train_cfg.batch_size,
-        num_workers=data_cfg.num_workers,
-        class_map_file=f"{train_cfg.save_dir}/class_map.json",
-    )
+    train_loader, val_loader, _ = _build_dataloaders(use_strong_aug=False)
     total_steps = len(train_loader)
 
+    teacher_ckpt = (args.teacher_ckpt or f"{train_cfg.save_dir}/teacher_best.pth")
     teacher = build_teacher(
-        checkpoint=f"{train_cfg.save_dir}/teacher_best.pth"
+        checkpoint=teacher_ckpt,
+        num_classes=data_cfg.num_classes,
+        image_size=data_cfg.image_size,
     ).to(device)
 
-    model = MoESystemTiny(
-        num_classes=200,
-        num_experts=router_cfg.num_experts,
-        compress_in=compressor_cfg.in_channels,
-        compress_out=compressor_cfg.out_channels,
-        decompress_out=expert_cfg.in_channels,
-        expert_hidden=expert_cfg.hidden_dim,
-        router_hidden=router_cfg.hidden_dim,
-    ).to(device)
+    model = _build_moe_model().to(device)
     for p in model.experts.parameters():  p.requires_grad = False
     for p in model.router.parameters():   p.requires_grad = False
 
@@ -341,39 +371,34 @@ def train_stage3(args, device):
           f"Ortho_w: {expert_drop_cfg.ortho_w}")
     sep("═"); print()
 
-    # v2: Stage 3 使用强数据增强
-    train_loader, val_loader, _ = build_dataloaders(
-        data_cfg.train_dir, data_cfg.val_dir,
-        image_size=data_cfg.image_size,
-        batch_size=train_cfg.batch_size,
-        num_workers=data_cfg.num_workers,
-        use_strong_aug=train_cfg.stage3_use_autoaugment,
+    # Stage 3 使用强数据增强
+    train_loader, val_loader, _ = _build_dataloaders(
+        use_strong_aug=train_cfg.stage3_use_autoaugment
     )
     total_steps = len(train_loader)
 
+    teacher_ckpt = (args.teacher_ckpt or f"{train_cfg.save_dir}/teacher_best.pth")
     teacher = build_teacher(
-        checkpoint=f"{train_cfg.save_dir}/teacher_best.pth"
+        checkpoint=teacher_ckpt,
+        num_classes=data_cfg.num_classes,
+        image_size=data_cfg.image_size,
     ).to(device)
 
-    model = MoESystemTiny(
-        num_classes=200,
-        num_experts=router_cfg.num_experts,
-        deploy_mode=args.mode,
-        expert_dropout=expert_drop_cfg.expert_dropout,
-        initial_alpha=alpha_sched_cfg.alpha_start,
-        dropout_rate=expert_cfg.dropout_rate,
-        compress_in=compressor_cfg.in_channels,
-        compress_out=compressor_cfg.out_channels,
-        decompress_out=expert_cfg.in_channels,
-        expert_hidden=expert_cfg.hidden_dim,
-        router_hidden=router_cfg.hidden_dim,
-    ).to(device)
+    model = _build_moe_model(deploy_mode=args.mode).to(device)
 
     ckpt2 = f"{train_cfg.save_dir}/stage2_best.pt"
     if os.path.exists(ckpt2):
         ck = torch.load(ckpt2, map_location="cpu", weights_only=False)
-        miss, unex = model.load_state_dict(ck["model"], strict=False)
-        print(f"  [Stage3] 加载Stage2权重  缺失:{len(miss)}  多余:{len(unex)}\n")
+        state_dict = ck["model"]
+        model_state = model.state_dict()
+        # 只过滤形状不匹配的 key（不同 head_type 导致的形状差异），保留 standalone_head
+        filtered = {k: v for k, v in state_dict.items()
+                    if k not in model_state or v.shape == model_state[k].shape}
+        skipped  = [k for k in state_dict if k not in filtered]
+        miss, unex = model.load_state_dict(filtered, strict=False)
+        print(f"  [Stage3] 加载Stage2权重  加载:{len(filtered)}  "
+              f"跳过(shape不匹配):{len(skipped)}  "
+              f"缺失:{len(miss)}  多余:{len(unex)}\n")
     else:
         print("  [Stage3] 未找到Stage2权重，随机初始化\n")
 
@@ -561,15 +586,29 @@ def train_stage3(args, device):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--stage", type=str, default="2", choices=["2", "3", "all"])
-    p.add_argument("--mode",  type=str, default="local", choices=["local","distributed"])
-    p.add_argument("--gpus",  type=str, default="1")
-    p.add_argument("--auto_eval", action="store_true", default=True)
+    p.add_argument("--stage",       type=str,   default="2", choices=["2", "3", "all"])
+    p.add_argument("--mode",        type=str,   default="local", choices=["local","distributed"])
+    p.add_argument("--gpus",        type=str,   default="0")
+    p.add_argument("--auto_eval",   action="store_true", default=True)
+    # v5.2: 允许命令行覆盖关键配置，方便多实验并行
+    p.add_argument("--save_dir",    type=str,   default=None,
+                   help="覆盖 train_cfg.save_dir（不同实验用不同目录）")
+    p.add_argument("--teacher_ckpt",type=str,   default=None,
+                   help="覆盖 teacher checkpoint 路径")
+    p.add_argument("--alpha_end",   type=float, default=None,
+                   help="覆盖 alpha_sched_cfg.alpha_end")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args   = parse_args()
+
+    # 命令行参数覆盖 config
+    if args.save_dir:
+        train_cfg.save_dir = args.save_dir
+    if args.alpha_end is not None:
+        alpha_sched_cfg.alpha_end = args.alpha_end
+
     gpu_id = int(args.gpus.split(",")[0])
     device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
 
@@ -577,7 +616,7 @@ if __name__ == "__main__":
         torch.backends.cudnn.benchmark = True
 
     sep("═")
-    print("  MoE-Tiny v5.1 — A100 80GB 单卡训练")
+    print("  MoE-Tiny v5.2 — NWPU-RESISC45 224×224，Phase A 无压缩验证")
     sep("═")
     print(f"  设备:    {device}")
     print(f"  Stage:   {args.stage}")
@@ -590,15 +629,7 @@ if __name__ == "__main__":
     print(f"  开始:    {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     sep("═"); print()
 
-    tmp = MoESystemTiny(
-        num_experts=router_cfg.num_experts,
-        dropout_rate=expert_cfg.dropout_rate,
-        compress_in=compressor_cfg.in_channels,
-        compress_out=compressor_cfg.out_channels,
-        decompress_out=expert_cfg.in_channels,
-        expert_hidden=expert_cfg.hidden_dim,
-        router_hidden=router_cfg.hidden_dim,
-    )
+    tmp = _build_moe_model()
     tmp.print_params(); del tmp; print()
 
     if args.stage == "all":

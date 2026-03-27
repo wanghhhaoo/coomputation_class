@@ -1,12 +1,14 @@
 """
-models/experts.py — 同构自学习专家网络 (v5.1)
+models/experts.py — 同构自学习专家网络 (v5.2)
 
 版本历史：
   v2: dropout_rate 可配置
   v5.1: 默认参数适配 MobileNetV3-Small 维度
         in_channels: 128 → 48（解压后通道）
-        hidden_dim:  256 → 96（更轻量）
-        num_layers:  3   → 2（输入特征图已够小）
+  v5.2: 适配 RESISC45 Phase A（无压缩）
+        in_channels: 48 → 24（直接用截断特征，无解压器）
+        num_classes: 200 → 45（RESISC45）
+        输入 (24, 28, 28)，通过 AdaptiveAvgPool 到 1×1 后分类
 """
 
 import torch
@@ -38,10 +40,10 @@ class SelfLearnExpert(nn.Module):
 
     def __init__(
         self,
-        in_channels: int  = 48,           # v5.1: 128 → 48
-        hidden_dim: int   = 96,           # v5.1: 256 → 96
-        num_classes: int  = 200,
-        num_layers: int   = 2,            # v5.1: 3 → 2
+        in_channels: int  = 24,           # v5.2: 48 → 24（Phase A 无解压器）
+        hidden_dim: int   = 96,
+        num_classes: int  = 45,           # v5.2: 200 → 45（RESISC45）
+        num_layers: int   = 2,
         dropout_rate: float = 0.5,
     ):
         super().__init__()
@@ -87,10 +89,10 @@ class SelfLearnExpert(nn.Module):
 
 def build_experts(
     num_experts: int  = 4,
-    in_channels: int  = 48,           # v5.1: 128 → 48
-    hidden_dim: int   = 96,           # v5.1: 256 → 96
-    num_classes: int  = 200,
-    num_layers: int   = 2,            # v5.1: 3 → 2
+    in_channels: int  = 24,           # v5.2: 48 → 24（Phase A）
+    hidden_dim: int   = 96,
+    num_classes: int  = 45,           # v5.2: 200 → 45
+    num_layers: int   = 2,
     dropout_rate: float = 0.5,
 ) -> nn.ModuleList:
     experts = nn.ModuleList([

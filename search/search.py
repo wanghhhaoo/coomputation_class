@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))     # project roo
 from config import (
     data_cfg, distill_cfg, train_cfg, expert_drop_cfg,
 )
-from data.dataset      import build_dataloaders
+from data.dataset      import build_dataloaders, build_resisc45_dataloaders
 from models.moe_system import MoESystemTiny
 from distill.losses    import BackboneDistillLoss, MoEDistillLoss, build_teacher
 from search_space      import (
@@ -55,6 +55,35 @@ search_cfg = SearchConfig()
 
 def sep(c="─", w=72): print(c * w)
 def eta_str(s): return str(datetime.timedelta(seconds=int(s)))
+
+
+def _build_dataloaders(use_strong_aug=False):
+    """根据 data_cfg.dataset 选择正确的数据加载器"""
+    if data_cfg.dataset == "resisc45":
+        return build_resisc45_dataloaders(
+            data_cfg.data_dir,
+            image_size=data_cfg.image_size,
+            batch_size=train_cfg.batch_size,
+            num_workers=data_cfg.num_workers,
+            train_ratio=data_cfg.train_ratio,
+            use_strong_aug=use_strong_aug,
+        )
+    else:
+        return build_dataloaders(
+            data_cfg.train_dir, data_cfg.val_dir,
+            image_size=data_cfg.image_size,
+            batch_size=train_cfg.batch_size,
+            num_workers=data_cfg.num_workers,
+            use_strong_aug=use_strong_aug,
+        )
+
+
+def _build_teacher(device):
+    return build_teacher(
+        checkpoint=f"{train_cfg.save_dir}/teacher_best.pth",
+        num_classes=data_cfg.num_classes,
+        image_size=data_cfg.image_size,
+    ).to(device)
 
 class AverageMeter:
     def __init__(self): self.reset()
@@ -260,11 +289,16 @@ def run_single_config(
     # 构建模型
     model = MoESystemTiny(config=config).to(device)
 
-    # 加载 Stage 2 权重（strict=False，head 结构可能不同）
+    # 加载 Stage 2 权重，过滤 standalone_head（不同 head_type 维度不同）
     if os.path.exists(stage2_ckpt):
         ck = torch.load(stage2_ckpt, map_location="cpu", weights_only=False)
-        miss, unex = model.load_state_dict(ck["model"], strict=False)
-        print(f"  [Load] Stage2 ckpt  缺失:{len(miss)}  多余:{len(unex)}")
+        state_dict = ck["model"]
+        filtered = {k: v for k, v in state_dict.items()
+                    if "standalone_head" not in k}
+        miss, unex = model.load_state_dict(filtered, strict=False)
+        print(f"  [Load] Stage2 ckpt  加载:{len(filtered)}  "
+              f"跳过standalone_head:{len(state_dict)-len(filtered)}  "
+              f"缺失:{len(miss)}  多余:{len(unex)}")
     else:
         print(f"  [Warn] 未找到 Stage2 ckpt: {stage2_ckpt}，随机初始化")
 
@@ -379,27 +413,15 @@ def run_phase1(args, device):
     sep("═")
 
     amp_dtype = get_amp_dtype() if train_cfg.use_amp else None
-    train_loader, val_loader, _ = build_dataloaders(
-        data_cfg.train_dir, data_cfg.val_dir,
-        image_size=data_cfg.image_size,
-        batch_size=train_cfg.batch_size,
-        num_workers=data_cfg.num_workers,
-        use_strong_aug=train_cfg.stage3_use_autoaugment,
+    train_loader, val_loader, _ = _build_dataloaders(
+        use_strong_aug=train_cfg.stage3_use_autoaugment
     )
-    teacher = build_teacher(
-        checkpoint=f"{train_cfg.save_dir}/teacher_best.pth"
-    ).to(device)
+    teacher = _build_teacher(device)
 
     # 按 cut_point 各跑一次 Stage 2
     stage2_ckpts = {}
     for cp in PHASE1_SPACE["cut_point"]:
-        # 单独加载无增强的 loader 用于 Stage 2
-        s2_train, s2_val, _ = build_dataloaders(
-            data_cfg.train_dir, data_cfg.val_dir,
-            image_size=data_cfg.image_size,
-            batch_size=train_cfg.batch_size,
-            num_workers=data_cfg.num_workers,
-        )
+        s2_train, s2_val, _ = _build_dataloaders(use_strong_aug=False)
         stage2_ckpts[cp] = run_stage2_once(cp, device, s2_train, s2_val, teacher)
 
     # 生成所有 Phase 1 配置并逐个搜索
@@ -447,16 +469,10 @@ def run_phase2(args, device):
         print(f"    [{i+1}] Val={r['best_val_acc']:.2f}%  {config_to_str(r['config'])}")
     print()
 
-    train_loader, val_loader, _ = build_dataloaders(
-        data_cfg.train_dir, data_cfg.val_dir,
-        image_size=data_cfg.image_size,
-        batch_size=train_cfg.batch_size,
-        num_workers=data_cfg.num_workers,
-        use_strong_aug=train_cfg.stage3_use_autoaugment,
+    train_loader, val_loader, _ = _build_dataloaders(
+        use_strong_aug=train_cfg.stage3_use_autoaugment
     )
-    teacher = build_teacher(
-        checkpoint=f"{train_cfg.save_dir}/teacher_best.pth"
-    ).to(device)
+    teacher = _build_teacher(device)
 
     all_results = []
     t_start = time.time()
@@ -502,16 +518,10 @@ def run_phase3(args, device):
         print(f"    [{i+1}] Val={r['best_val_acc']:.2f}%  {config_to_str(r['config'])}")
     print()
 
-    train_loader, val_loader, _ = build_dataloaders(
-        data_cfg.train_dir, data_cfg.val_dir,
-        image_size=data_cfg.image_size,
-        batch_size=train_cfg.batch_size,
-        num_workers=data_cfg.num_workers,
-        use_strong_aug=train_cfg.stage3_use_autoaugment,
+    train_loader, val_loader, _ = _build_dataloaders(
+        use_strong_aug=train_cfg.stage3_use_autoaugment
     )
-    teacher = build_teacher(
-        checkpoint=f"{train_cfg.save_dir}/teacher_best.pth"
-    ).to(device)
+    teacher = _build_teacher(device)
 
     final_results = []
 

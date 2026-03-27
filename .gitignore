@@ -1,4 +1,7 @@
 __pycache__/
+.claude/
+checkpoints_resisc/
+checkpoints_resisc_a03/
 *.pyc
 *.pyo
 *.pth
@@ -8,5 +11,5 @@ __pycache__/
 *.h5
 *.npy
 *.npz
-data/
 *.log
+

@@ -1,13 +1,14 @@
 """
-models/backbone.py — 小图像适配版主干 (v5.2)
+models/backbone.py — 主干网络 (v5.2)
 
 版本历史：
-  v5.1.1: MobileNetV3-Small, stem stride=1, 截断 (B, 24, 16, 16)
-  v5.2:   BackboneMobileNetV3 参数化 head_type 和 cut_point
-          支持 stage1 (24ch, 16×16) 和 stage2 (40ch, 8×8) 两种截断点
-          支持 linear / mlp_small / mlp_medium / full_network 四种 head
+  v5.1.1: MobileNetV3-Small, stem stride=1（Tiny-ImageNet 64×64 适配）
+  v5.2:   切换 NWPU-RESISC45 224×224
+          Student: 恢复默认 stem stride=2（224×224 足够大，不需要改）
+          截断点 stage1: (24, 28, 28)  stage2: (40, 14, 14)
+          Teacher: 新增 image_size 参数，224×224 使用标准 ResNet-50 stem
 
-Teacher（ResNet-50）完全不变。
+Teacher（ResNet-50）新增 image_size 参数。
 """
 
 import torch
@@ -54,9 +55,10 @@ class BackboneMobileNetV3(nn.Module):
     """
 
     # cut_point → (features_early slice, features_late slice, channels, spatial)
+    # spatial 对应 224×224 输入、stem stride=2 时的特征图尺寸
     CUT_CONFIG = {
-        "stage1": (slice(0, 4), slice(4, None), 24, 16),
-        "stage2": (slice(0, 7), slice(7, None), 40,  8),
+        "stage1": (slice(0, 4), slice(4, None), 24, 28),  # (B, 24, 28, 28)
+        "stage2": (slice(0, 7), slice(7, None), 40, 14),  # (B, 40, 14, 14)
     }
 
     def __init__(
@@ -82,16 +84,8 @@ class BackboneMobileNetV3(nn.Module):
         else:
             base = models.mobilenet_v3_small(weights=None)
 
-        # v5.1.1: stem stride 2→1
-        old_conv = base.features[0][0]
-        new_conv = nn.Conv2d(
-            old_conv.in_channels, old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=1, padding=old_conv.padding,
-            bias=old_conv.bias is not None,
-        )
-        new_conv.weight.data.copy_(old_conv.weight.data)
-        base.features[0][0] = new_conv
+        # v5.2: 224×224 输入，保持默认 stem stride=2（不需要修改）
+        # v5.1.1 的 stride=1 改动仅适用于 64×64 Tiny-ImageNet，224×224 不需要
 
         # 截断点
         early_sl, late_sl, feat_ch, feat_sp = self.CUT_CONFIG[cut_point]
@@ -132,7 +126,8 @@ class BackboneMobileNetV3(nn.Module):
             )
 
         print(f"[Backbone] MobileNetV3-Small  cut={cut_point}({feat_ch}ch,{feat_sp}×{feat_sp})  "
-              f"head={head_type}  pretrained={pretrained}")
+              f"head={head_type}  pretrained={pretrained}  "
+              f"(224×224 输入，stem stride=2)")
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """截断输出，喂给压缩器/专家"""
@@ -166,23 +161,52 @@ class BackboneMobileNetV3(nn.Module):
 # ── Teacher：ResNet-50，完全不变 ────────────────────────────
 
 class BackboneResNet50Teacher(nn.Module):
-    """Teacher：layer3 截断 → (B, 1024, 16, 16)"""
+    """
+    Teacher：ResNet-50
 
-    def __init__(self, num_classes: int = 200, pretrained: bool = True):
+    image_size < 128（如 64×64 Tiny-ImageNet）：
+      stem 改为 3×3 stride=1 + Identity maxpool（小图像适配）
+    image_size >= 128（如 224×224 RESISC45）：
+      保持标准 ResNet-50 stem（7×7 stride=2 + 3×3 maxpool）
+    """
+
+    def __init__(self, num_classes: int = 200, pretrained: bool = True,
+                 image_size: int = 64):
         super().__init__()
+        small_image = image_size < 128
+
         if pretrained:
             base_pretrained = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
             base = models.resnet50(weights=None)
-            base.conv1  = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            base.maxpool = nn.Identity()
-            base.fc      = nn.Linear(2048, num_classes)
-            base = load_pretrained_except_stem(base, base_pretrained)
+            if small_image:
+                base.conv1  = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                base.maxpool = nn.Identity()
+            base.fc = nn.Linear(2048, num_classes)
+            if small_image:
+                base = load_pretrained_except_stem(base, base_pretrained)
+            else:
+                # 标准 stem 权重可以直接复用，只跳过 fc
+                sd_pre = base_pretrained.state_dict()
+                sd_cur = base.state_dict()
+                loaded, skipped = 0, 0
+                for k, v in sd_pre.items():
+                    if k.startswith("fc"):
+                        skipped += 1; continue
+                    if k in sd_cur and sd_cur[k].shape == v.shape:
+                        sd_cur[k] = v; loaded += 1
+                    else:
+                        skipped += 1
+                base.load_state_dict(sd_cur)
+                print(f"[Backbone] 预训练权重加载: {loaded} 层  跳过: {skipped} 层 (fc/shape不匹配)")
         else:
             base = models.resnet50(weights=None)
-            base.conv1  = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            base.maxpool = nn.Identity()
-            base.fc      = nn.Linear(2048, num_classes)
+            if small_image:
+                base.conv1  = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                base.maxpool = nn.Identity()
+            base.fc = nn.Linear(2048, num_classes)
 
+        print(f"[Teacher] ResNet-50  num_classes={num_classes}  "
+              f"image_size={image_size}  small_image={small_image}  pretrained={pretrained}")
         self.stem    = nn.Sequential(base.conv1, base.bn1, base.relu)
         self.pool    = base.maxpool
         self.layer1  = base.layer1
